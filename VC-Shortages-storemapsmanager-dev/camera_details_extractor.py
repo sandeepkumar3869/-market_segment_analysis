@@ -1,11 +1,11 @@
 """
-Camera Details Extractor
+Camera Details Extractor with Zone Mapping
 
 This script extracts comprehensive camera details for a specific store including:
-- Camera name and ID
+- Camera name and ID (from Trueye API: macid, friendly_name)
+- Zone name (mapped from friendly_name pattern matching)
 - X, Y coordinates (store map local coordinates in meters)
-- Coverage area (section name)
-- Area coverage (in square meters)
+- Coverage area (section name and area in square meters)
 - Viewing angle/compactness
 - Travel time within coverage area
 - Camera viewing distance (shortest and longest)
@@ -27,10 +27,12 @@ import json
 class CameraDetailsExtractor:
     """
     Extract and analyze camera details for a given store including:
-    - Position coordinates
-    - Coverage zones
-    - Viewing angles
+    - Position coordinates (X, Y from zone centroid or input)
+    - Coverage zones (mapped from friendly_name)
+    - Viewing angles (compactness calculation)
     - Travel time metrics
+    
+    Works with Trueye camera data (macid, friendly_name)
     """
     
     def __init__(self, store_number: str, floor_number: int = 1):
@@ -123,7 +125,7 @@ class CameraDetailsExtractor:
     
     def calculate_compactness(self, polygon) -> float:
         """
-        Calculate polygon compactness (circularity)
+        Calculate polygon compactness (circularity / viewing angle quality)
         Formula: 4π × area / perimeter²
         Values closer to 1 indicate more circular/compact shape
         
@@ -166,37 +168,127 @@ class CameraDetailsExtractor:
         travel_time = round(distance / speed, 3)
         return travel_time
     
-    def load_camera_data(self, camera_data: pd.DataFrame):
+    def enrich_camera_data_with_zones(self, camera_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Load camera ping data
+        Enrich camera dataframe with zone information by:
+        1. Extracting zone names from friendly_name pattern matching
+        2. Mapping to zone centroids for X, Y coordinates
+        3. Adding zone area and unique IDs
         
         Args:
-            camera_data (pd.DataFrame): DataFrame with camera positions
-                Expected columns: 'device_id', 'store_map_local_x_coordinate', 
-                                 'store_map_local_y_coordinate', 'position_id'
+            camera_df (pd.DataFrame): Camera data from Trueye with macid, friendly_name
+                Expected columns: 'macid' (or 'device_id'), 'friendly_name'
+            
+        Returns:
+            pd.DataFrame: Enriched with zone_name, x_coordinate, y_coordinate, etc.
         """
-        self.camera_data = camera_data
+        
+        if self.shape_zones is None:
+            print("⚠ WARNING: No shape_zones loaded. Skipping zone enrichment.")
+            return camera_df
+        
+        # Normalize column names
+        camera_df = camera_df.copy()
+        if 'macid' in camera_df.columns and 'device_id' not in camera_df.columns:
+            camera_df['device_id'] = camera_df['macid']
+        
+        # Initialize new columns
+        camera_df['zone_name'] = None
+        camera_df['zone_unique_id'] = None
+        camera_df['zone_area_in_square_meter'] = None
+        camera_df['store_map_local_x_coordinate'] = None
+        camera_df['store_map_local_y_coordinate'] = None
+        camera_df['coordinate_source'] = None
+        
+        # Parse zone geometries
+        shape_zones = self.shape_zones.copy()
+        
+        if 'shape_outer_coordinates_geo' not in shape_zones.columns:
+            print("⚠ WARNING: shape_outer_coordinates_geo column not found in zones")
+            return camera_df
+        
+        shape_zones['geometry'] = shape_zones['shape_outer_coordinates_geo'].apply(
+            self.parse_wkt_geometry
+        )
+        
+        zone_gdf = gpd.GeoDataFrame(shape_zones, geometry='geometry')
+        
+        print(f"\n[ENRICHING] Mapping {len(camera_df)} cameras to zones...")
+        
+        # ========================================================================
+        # METHOD: Extract zone from friendly_name pattern matching
+        # ========================================================================
+        
+        for idx, camera in camera_df.iterrows():
+            friendly_name = str(camera.get('friendly_name', '')).lower()
+            device_id = camera.get('device_id', camera.get('macid', f'CAM_{idx}'))
+            
+            found_zone = False
+            
+            # Try to match zone names from friendly_name
+            for _, zone in zone_gdf.iterrows():
+                zone_name = str(zone['shape_name']).lower()
+                
+                if zone_name in friendly_name or friendly_name in zone_name:
+                    camera_df.at[idx, 'zone_name'] = zone['shape_name']
+                    camera_df.at[idx, 'zone_unique_id'] = zone.get('shape_unique_id', 'N/A')
+                    camera_df.at[idx, 'zone_area_in_square_meter'] = zone.get('shape_area', 0)
+                    camera_df.at[idx, 'coordinate_source'] = 'zone_centroid'
+                    
+                    # Get centroid as camera position
+                    centroid = zone.geometry.centroid
+                    camera_df.at[idx, 'store_map_local_x_coordinate'] = round(centroid.x, 3)
+                    camera_df.at[idx, 'store_map_local_y_coordinate'] = round(centroid.y, 3)
+                    
+                    print(f"  ✓ {device_id:20} → {zone['shape_name']}")
+                    found_zone = True
+                    break
+            
+            if not found_zone:
+                print(f"  ⚠ {device_id:20} → No matching zone found")
+        
+        return camera_df
     
-    def load_shape_data(self, shape_zones: pd.DataFrame, shape_areas: pd.DataFrame):
+    def load_camera_data(self, camera_data: pd.DataFrame):
+        """
+        Load camera ping/metadata data
+        
+        Args:
+            camera_data (pd.DataFrame): DataFrame with camera data
+                Can have columns: 'macid' (Trueye), 'device_id', 'friendly_name',
+                'store_map_local_x_coordinate', 'store_map_local_y_coordinate', 
+                'position_id', 'zone_name', etc.
+        """
+        self.camera_data = camera_data.copy()
+        print(f"✓ Loaded {len(self.camera_data)} camera records")
+        print(f"  Columns: {list(self.camera_data.columns)}")
+    
+    def load_shape_data(self, shape_zones: pd.DataFrame, shape_areas: Optional[pd.DataFrame] = None):
         """
         Load store shape data (zones and areas)
         
         Args:
             shape_zones (pd.DataFrame): Zone shapes from BR3
-            shape_areas (pd.DataFrame): Area shapes from BR3
+                Expected columns: 'shape_name', 'shape_unique_id', 'shape_area',
+                'shape_outer_coordinates_geo' (WKT format)
+            shape_areas (pd.DataFrame): Area shapes from BR3 (optional)
         """
         self.shape_zones = shape_zones
         self.shape_areas = shape_areas
+        
+        print(f"✓ Loaded {len(self.shape_zones)} zone shapes")
+        if shape_areas is not None:
+            print(f"✓ Loaded {len(self.shape_areas)} area shapes")
     
     def get_camera_details_by_name(self, 
                                    camera_name: str,
                                    camera_data: Optional[pd.DataFrame] = None,
                                    shape_zones: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
         """
-        Extract comprehensive details for a specific camera by name/device_id
+        Extract comprehensive details for a specific camera by name/device_id/macid
         
         Args:
-            camera_name (str): Camera name or device_id (e.g., 'CAM_001')
+            camera_name (str): Camera name, device_id, or macid (e.g., 'CAM_001', 'Electronics Aisle 1')
             camera_data (pd.DataFrame, optional): Camera position data
             shape_zones (pd.DataFrame, optional): Zone shape data
             
@@ -213,13 +305,21 @@ class CameraDetailsExtractor:
         if self.camera_data is None:
             return {'error': 'No camera data loaded'}
         
-        # Filter for specific camera
-        camera_records = self.camera_data[
-            (self.camera_data['device_id'].astype(str) == camera_name) |
-            (self.camera_data['device_id'].astype(str).str.contains(camera_name, case=False, na=False))
-        ]
+        # Filter for specific camera (search in multiple columns)
+        search_columns = ['device_id', 'macid', 'friendly_name']
+        camera_records = None
         
-        if camera_records.empty:
+        for col in search_columns:
+            if col in self.camera_data.columns:
+                matches = self.camera_data[
+                    (self.camera_data[col].astype(str) == camera_name) |
+                    (self.camera_data[col].astype(str).str.contains(camera_name, case=False, na=False))
+                ]
+                if not matches.empty:
+                    camera_records = matches
+                    break
+        
+        if camera_records is None or camera_records.empty:
             return {'error': f'Camera "{camera_name}" not found in store {self.store_number}'}
         
         # Extract the first record (most recent or representative)
@@ -229,18 +329,25 @@ class CameraDetailsExtractor:
             'store_number': self.store_number,
             'floor_number': self.floor_number,
             'camera_name': camera_name,
-            'camera_id': camera_record.get('device_id', 'N/A'),
+            'macid': camera_record.get('macid', camera_record.get('device_id', 'N/A')),
+            'device_id': camera_record.get('device_id', camera_record.get('macid', 'N/A')),
+            'friendly_name': camera_record.get('friendly_name', 'N/A'),
             'position_id': camera_record.get('position_id', 'N/A'),
             'total_records': len(camera_records),
         }
         
         # ========== COORDINATES ==========
         if 'store_map_local_x_coordinate' in camera_record and 'store_map_local_y_coordinate' in camera_record:
-            camera_details['coordinates'] = {
-                'x_coordinate': round(float(camera_record['store_map_local_x_coordinate']), 3),
-                'y_coordinate': round(float(camera_record['store_map_local_y_coordinate']), 3),
-                'unit': 'meters'
-            }
+            x_val = camera_record['store_map_local_x_coordinate']
+            y_val = camera_record['store_map_local_y_coordinate']
+            
+            if pd.notna(x_val) and pd.notna(y_val):
+                camera_details['coordinates'] = {
+                    'x_coordinate': round(float(x_val), 3),
+                    'y_coordinate': round(float(y_val), 3),
+                    'unit': 'meters',
+                    'source': camera_record.get('coordinate_source', 'input')
+                }
         
         # ========== COVERAGE ZONE INFORMATION ==========
         if 'zone_name' in camera_record and pd.notna(camera_record['zone_name']):
@@ -248,7 +355,8 @@ class CameraDetailsExtractor:
                 'zone_name': camera_record['zone_name'],
                 'zone_unique_id': camera_record.get('zone_unique_id', 'N/A'),
                 'zone_area_sqm': round(float(camera_record['zone_area_in_square_meter']), 2) 
-                    if 'zone_area_in_square_meter' in camera_record else 'N/A'
+                    if 'zone_area_in_square_meter' in camera_record and pd.notna(camera_record['zone_area_in_square_meter']) 
+                    else 'N/A'
             }
         
         # ========== MERCHANDISE AREA ==========
@@ -257,7 +365,8 @@ class CameraDetailsExtractor:
                 'area_name': camera_record['merch_area_adjacency_name'],
                 'area_unique_id': camera_record.get('merch_area_unique_id', 'N/A'),
                 'area_sqm': round(float(camera_record['merch_area_in_square_meter']), 2)
-                    if 'merch_area_in_square_meter' in camera_record else 'N/A'
+                    if 'merch_area_in_square_meter' in camera_record and pd.notna(camera_record['merch_area_in_square_meter'])
+                    else 'N/A'
             }
         
         # ========== RACETRACK INFORMATION ==========
@@ -265,7 +374,7 @@ class CameraDetailsExtractor:
             camera_details['is_in_racetrack'] = bool(camera_record['is_position_in_racetrack_f'])
         
         # ========== ZONE-LEVEL COVERAGE METRICS ==========
-        if self.shape_zones is not None and 'zone_name' in camera_record:
+        if self.shape_zones is not None and 'zone_name' in camera_record and pd.notna(camera_record['zone_name']):
             zone_name = camera_record['zone_name']
             zone_records = self.shape_zones[
                 self.shape_zones['shape_name'].str.lower() == str(zone_name).lower()
@@ -348,8 +457,9 @@ class CameraDetailsExtractor:
         if self.camera_data is None:
             return [{'error': 'No camera data loaded'}]
         
-        # Get unique camera names
-        unique_cameras = self.camera_data['device_id'].unique()
+        # Get unique camera identifiers
+        camera_col = 'device_id' if 'device_id' in self.camera_data.columns else 'macid'
+        unique_cameras = self.camera_data[camera_col].unique()
         
         all_camera_details = []
         for camera in unique_cameras:
@@ -411,33 +521,30 @@ class CameraDetailsExtractor:
 def example_usage():
     """
     Example: Extract camera details for store 1234, camera 'CAM_001'
+    
+    Works with:
+    1. Trueye API data (macid, friendly_name)
+    2. Neptune zone data (shape_name, shape_area, shape_outer_coordinates_geo)
     """
     
     # Initialize extractor
     extractor = CameraDetailsExtractor(store_number='1234', floor_number=1)
     
-    # === SAMPLE DATA (In real scenario, load from BR3/Database) ===
+    # === SAMPLE DATA (In real scenario, load from Trueye + BR3) ===
     
-    # Sample camera data
+    # Sample camera data (from Trueye basic_info API)
     camera_data = pd.DataFrame({
-        'device_id': ['CAM_001', 'CAM_002', 'CAM_003', 'CAM_001'],
-        'store_map_local_x_coordinate': [100.5, 150.2, 200.8, 100.3],
-        'store_map_local_y_coordinate': [200.3, 180.5, 220.1, 200.5],
-        'position_id': ['POS_1', 'POS_2', 'POS_3', 'POS_1'],
-        'zone_name': ['electronics', 'grocery', 'electronics', 'electronics'],
-        'zone_unique_id': ['ZONE_001', 'ZONE_002', 'ZONE_001', 'ZONE_001'],
-        'zone_area_in_square_meter': [500.0, 750.0, 500.0, 500.0],
-        'merch_area_adjacency_name': ['electronics_area', 'grocery_area', 'electronics_area', 'electronics_area'],
-        'merch_area_unique_id': ['MA_001', 'MA_002', 'MA_001', 'MA_001'],
-        'merch_area_in_square_meter': [1200.0, 1800.0, 1200.0, 1200.0],
-        'is_position_in_racetrack_f': [False, True, False, False]
+        'macid': ['AA:BB:CC:DD:EE:01', 'AA:BB:CC:DD:EE:02', 'AA:BB:CC:DD:EE:03'],
+        'friendly_name': ['Electronics Aisle 1', 'Grocery Section A', 'Electronics Aisle 2'],
+        'device_id': ['CAM_001', 'CAM_002', 'CAM_003'],
+        'position_id': ['POS_1', 'POS_2', 'POS_3'],
     })
     
-    # Sample zone shape data
+    # Sample zone shape data (from BR3 store_shape_agg)
     shape_zones = pd.DataFrame({
         'shape_name': ['electronics', 'grocery'],
         'shape_unique_id': ['ZONE_001', 'ZONE_002'],
-        'shape_area': [500.0, 750.0],
+        'shape_area': [5000.0, 8000.0],
         'shape_outer_coordinates_geo': [
             'POLYGON ((50 150, 150 150, 150 250, 50 250, 50 150))',
             'POLYGON ((100 100, 200 100, 200 260, 100 260, 100 100))'
@@ -448,12 +555,28 @@ def example_usage():
     extractor.load_camera_data(camera_data)
     extractor.load_shape_data(shape_zones, None)
     
-    # ========== EXTRACT SINGLE CAMERA DETAILS ==========
+    # ========== ENRICH CAMERA DATA WITH ZONES ==========
     print("=" * 80)
+    print("ENRICHING CAMERA DATA WITH ZONE INFORMATION")
+    print("=" * 80)
+    
+    enriched_camera_df = extractor.enrich_camera_data_with_zones(camera_data)
+    
+    print("\n📹 ENRICHED CAMERA DATA:")
+    print(enriched_camera_df[[
+        'macid', 'friendly_name', 'zone_name', 
+        'store_map_local_x_coordinate', 'store_map_local_y_coordinate'
+    ]].to_string())
+    
+    # Update extractor with enriched data
+    extractor.load_camera_data(enriched_camera_df)
+    
+    # ========== EXTRACT SINGLE CAMERA DETAILS ==========
+    print("\n" + "=" * 80)
     print("CAMERA DETAILS EXTRACTION - STORE 1234")
     print("=" * 80)
     
-    camera_details = extractor.get_camera_details_by_name('CAM_001')
+    camera_details = extractor.get_camera_details_by_name('Electronics Aisle 1')
     
     print("\n📹 CAMERA DETAILS:")
     print(json.dumps(camera_details, indent=2))
@@ -477,8 +600,8 @@ def example_usage():
     json_output = extractor.export_camera_details(camera_details, file_format='json')
     print(json_output)
     
-    return extractor, camera_details
+    return extractor, camera_details, enriched_camera_df
 
 
 if __name__ == "__main__":
-    extractor, camera_details = example_usage()
+    extractor, camera_details, enriched_df = example_usage()
