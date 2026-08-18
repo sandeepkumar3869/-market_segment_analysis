@@ -1,0 +1,51 @@
+version: "1"
+
+docker_build: &docker_build
+  image: docker.target.com/vela-plugins/kaniko:v0.19.2-1@sha256:b08b33057c3c3c51ef21c0ce04e651412677da4ecf486058a5dc54d438fab54a
+  id_request: true
+  pull: not_present
+  secrets:
+    - source: artifactory_password
+      target: docker_password
+  parameters:
+    registry: docker.target.com
+    dockerfile: Dockerfile
+
+plugin_base_params: &plugin_base_params
+  repo: docker.target.com/iam/{{ index (vela "REPO_CUSTOM_PROPS" | fromJson) "IAM-Application" }}/{{ vela "VELA_REPO_NAME" | lower }}
+
+steps:
+  - name: populate_docker_credentials
+    image: docker.target.com/iam/ci/vela-plugins/artifactory-managed-auth:v4.0.3@sha256:74737e0f78f87b5ff8426867eca814b8f6c495c7d0140b78204305540c9bfe1f
+    id_request: true
+    parameters:
+      auth_server: https://artifactorytokenmanager.prod.target.com
+
+  - name: build-and-publish-docker-image-dev
+    <<: *docker_build
+    parameters:
+      tags:
+        - "db${BUILD_NUMBER}-${BUILD_COMMIT:0:8}"
+      <<: *plugin_base_params
+    ruleset:
+      event: push
+      branch: [dev]
+
+  - name: build-and-publish-docker-image-prod
+    <<: *docker_build
+    parameters:
+      tags:
+        - "b${BUILD_NUMBER}-${BUILD_COMMIT:0:8}"
+      <<: *plugin_base_params
+    ruleset:
+      event: push
+      branch: [main]
+
+  - name: release-prod-tag
+    <<: *docker_build
+    parameters:
+      tags: ['${BUILD_TAG}']
+      <<: *plugin_base_params
+    ruleset:
+      event: tag
+      branch: [main]
